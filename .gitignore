@@ -1,0 +1,22 @@
+# Python virtual environment
+backend/venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node dependencies
+frontend/node_modules/
+.eslintcache
+
+# Data and Logs
+backend/chroma_data/
+backend/uploads/
+backend/logs/
+
+# IDE settings
+.idea/
+.DS_Store
+
+# Large Model Weights (Keep the folder, ignore the heavy files)
+models/blip_finetuned/*.bin
+models/blip_finetuned/*.pth

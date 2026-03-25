@@ -196,15 +196,43 @@ InfoRetrieval_v2Claude/
 
 ### Prerequisites
 
-- **Python 3.11+**
-- **Node.js 18+**
-- **Tesseract OCR** (optional, for enhanced OCR):
-  ```bash
-  brew install tesseract          # macOS
-  sudo apt install tesseract-ocr  # Ubuntu
-  ```
+Install these **before** cloning:
 
-### Backend Setup
+| Dependency | macOS | Ubuntu/Debian |
+|---|---|---|
+| **Python 3.11+** | `brew install python@3.13` | `sudo apt install python3.11 python3.11-venv` |
+| **Node.js 18+** | `brew install node` | `curl -fsSL https://deb.nodesource.com/setup_18.x \| sudo -E bash - && sudo apt install -y nodejs` |
+| **Tesseract OCR** | `brew install tesseract` | `sudo apt install tesseract-ocr` |
+| **Git LFS** | `brew install git-lfs && git lfs install` | `sudo apt install git-lfs && git lfs install` |
+| **Ollama** | `brew install ollama` or [ollama.com](https://ollama.com) | `curl -fsSL https://ollama.com/install.sh \| sh` |
+
+### Step 1: Install Ollama & Granite Model
+
+Ollama runs the local LLM (IBM Granite 8B) that powers the RAG chat Q&A. **This is required.**
+
+```bash
+# After installing Ollama, pull the model (~5GB download)
+ollama pull granite3.1-dense:8b
+
+# Verify
+ollama list
+# Should show: granite3.1-dense:8b    5.0 GB
+
+# Ollama must be running when the backend is active (serves on localhost:11434)
+# On macOS it runs as a service automatically after install
+# On Linux: ollama serve
+```
+
+### Step 2: Clone the Repository
+
+```bash
+git clone https://github.com/TheJASSZ/InfoRetrieval_v2.git
+cd InfoRetrieval_v2
+```
+
+Git LFS will automatically download the fine-tuned model weights (~860MB T5 + 4.5MB BLIP).
+
+### Step 3: Backend Setup
 
 ```bash
 cd backend
@@ -222,15 +250,47 @@ playwright install chromium
 
 # Copy and configure environment
 cp .env.example .env
-# Edit .env if needed (defaults work for local development)
 ```
 
-### Frontend Setup
+### Step 4: Configure Environment
+
+Edit `backend/.env` — **update paths to match your system**:
+
+```env
+DEVICE_PREFERENCE=auto
+CHROMA_PERSIST_DIR=./chroma_data
+CHROMA_COLLECTION=info_store
+
+# Models — SUMMARIZER_MODEL MUST be an absolute path
+BLIP_MODEL_PATH=../models/blip_finetuned
+SUMMARIZER_MODEL=/absolute/path/to/InfoRetrieval_v2/backend/app/models/t5_finetuned/final_model_h200
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+RAG_LLM_MODEL=google/flan-t5-large
+
+# Watchdog — directories to auto-monitor (comma-separated, absolute paths)
+WATCH_DIRS=/absolute/path/to/InfoRetrieval_v2/watch_data/documents,/absolute/path/to/InfoRetrieval_v2/watch_data/images
+BOOKMARK_PATH=~/Library/Application Support/Google/Chrome/Default/Bookmarks
+
+HOST=0.0.0.0
+PORT=8000
+LOG_LEVEL=INFO
+```
+
+> **Important:** The `SUMMARIZER_MODEL` path **must be absolute** (starting with `/`). Relative paths like `./models/...` will be misinterpreted as HuggingFace repo IDs and throw "Repo id must be in the form 'repo_name'" errors.
+
+### Step 5: Create Watch Directories
+
+```bash
+cd ..  # Back to project root
+mkdir -p watch_data/documents watch_data/images
+```
+
+Drop any `.txt`, `.pdf`, `.docx`, `.jpg`, `.png` files here and they'll be auto-processed by the watchdog.
+
+### Step 6: Frontend Setup
 
 ```bash
 cd frontend
-
-# Install Node dependencies
 npm install
 ```
 
@@ -238,26 +298,37 @@ npm install
 
 ## Running the Application
 
-### Start Backend (Terminal 1)
+You need **3 processes** running:
+
+### Terminal 1: Ollama (if not already running as a service)
+
+```bash
+ollama serve
+# Verify: curl http://localhost:11434/api/tags
+```
+
+### Terminal 2: Backend
 
 ```bash
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 The backend starts at **http://localhost:8000**
 - Swagger docs: **http://localhost:8000/docs**
 - Health check: **http://localhost:8000/health**
+- Watchdog auto-starts on configured `WATCH_DIRS`
+- First request loads ML models (30-60s), subsequent requests are fast
 
-### Start Frontend (Terminal 2)
+### Terminal 3: Frontend
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-The frontend starts at **http://localhost:5173** with API proxy to the backend.
+The frontend starts at **http://localhost:5173**.
 
 ### Quick Test
 
@@ -277,6 +348,21 @@ curl -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"query": "Ask a question about your stored content"}'
 ```
+
+---
+
+## Common Troubleshooting
+
+| Issue | Fix |
+|---|---|
+| **Frontend shows "Offline"** | Ensure backend is running on port 8000. Check `http://localhost:8000/health` |
+| **Chat keeps spinning / never responds** | Ensure Ollama is running (`curl http://localhost:11434/api/tags`). Pull model if missing: `ollama pull granite3.1-dense:8b` |
+| **First request is very slow (30-60s)** | Normal — ML models load lazily on first use. Subsequent requests are fast |
+| **"Repo id must be in the form 'repo_name'"** | Your `SUMMARIZER_MODEL` path is relative. Change to absolute path starting with `/` |
+| **Server hangs / becomes unresponsive** | The embedder may be stuck on MPS. Code auto-falls back to CPU, but restart the server if needed |
+| **Stats show 0 documents** | The watchdog processes files in the background. Check `backend/logs/main.log` for progress |
+| **Bookmark sync takes forever** | Bookmark sync runs in background. Check progress at `http://localhost:8000/api/bookmarks/status` |
+| **Playwright scraping fails** | Run `playwright install chromium` in your venv. Some sites block headless browsers (Cloudflare) |
 
 ---
 
@@ -536,9 +622,10 @@ The Docker setup includes Tesseract OCR and Playwright Chromium pre-installed.
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| **Frontend** | React 18, Vite, Bootstrap 5 | Responsive dashboard UI |
+| **Frontend** | React 18, TypeScript, Vite, TailwindCSS | ChatGPT-style chat interface |
 | **Backend** | FastAPI, Uvicorn | REST API with async support |
-| **Summarization** | Google FLAN-T5 (base/large) | Text summarization + RAG answers + tag generation |
+| **Summarization** | Fine-tuned T5-base (CNN/DailyMail, H200) | Text summarization + tag generation |
+| **RAG Q&A** | IBM Granite 3.1 Dense 8B via Ollama | Grounded conversational answers (no hallucination) |
 | **Image Captioning** | Salesforce BLIP + LoRA (PEFT) | Visual image descriptions |
 | **Embeddings** | BAAI BGE-base-en-v1.5 | 768-dim semantic embeddings (MTEB benchmark leader) |
 | **Vector DB** | ChromaDB | Persistent vector storage with hybrid search |

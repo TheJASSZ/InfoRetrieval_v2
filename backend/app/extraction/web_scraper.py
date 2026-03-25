@@ -32,14 +32,28 @@ async def scrape_with_playwright(url: str) -> str | None:
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            # Wait for body content to render
-            await page.wait_for_selector("body", timeout=10000)
+            page = await browser.new_page(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            # Wait for JS rendering and potential Cloudflare challenge
+            await page.wait_for_timeout(3000)
             content = await page.inner_text("body")
+
+            # Check if we hit a Cloudflare/bot check page
+            if content and "security" in content.lower() and "verification" in content.lower():
+                logger.info(f"Cloudflare challenge detected for {url}, waiting...")
+                await page.wait_for_timeout(5000)
+                content = await page.inner_text("body")
+
             await browser.close()
 
             if content and len(content.strip()) > 50:
+                # Filter out security/bot check pages
+                lower = content.lower()
+                if "performing security verification" in lower and len(content) < 200:
+                    logger.warning(f"Only got security page for {url}")
+                    return None
                 logger.info(f"Playwright extracted {len(content)} chars from {url}")
                 return content.strip()
             return None
@@ -50,6 +64,12 @@ async def scrape_with_playwright(url: str) -> str | None:
 
 async def extract_from_url(url: str) -> str:
     """Try Trafilatura first (fast), fall back to Playwright (thorough)."""
+    # Skip URLs that are unlikely to have useful content
+    skip_domains = ["outlook.office.com", "mail.google.com", "accounts.google.com",
+                    "login.", "signin.", "auth."]
+    if any(d in url.lower() for d in skip_domains):
+        raise ValueError(f"Skipping login/mail URL: {url}")
+
     text = scrape_with_trafilatura(url)
     if text:
         return text

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import shutil
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException
@@ -75,7 +76,10 @@ async def store_url(request: StoreURLRequest):
     """Extract, summarize, and store content from a URL."""
     try:
         text = await extract_from_url(request.url)
-        return _process_and_store(text, source_type="url", source=request.url)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, _process_and_store, text, "url", request.url
+        )
     except Exception as e:
         logger.error(f"Store URL error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -86,7 +90,10 @@ async def store_text(request: StoreTextRequest):
     """Store a raw text note."""
     try:
         source = request.title or "text_note"
-        return _process_and_store(request.text, source_type="text", source=source)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, _process_and_store, request.text, "text", source
+        )
     except Exception as e:
         logger.error(f"Store text error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -181,8 +188,13 @@ def _process_image(image_path: str, source: str) -> IngestResponse:
 async def search_info(request: SearchRequest):
     """Semantic search across stored content."""
     try:
-        query_embedding = embed_text(request.query)
-        results = hybrid_search(request.query, query_embedding, top_k=request.top_k)
+        loop = asyncio.get_event_loop()
+        query_embedding = await loop.run_in_executor(None, embed_text, request.query)
+
+        def _search():
+            return hybrid_search(request.query, query_embedding, top_k=request.top_k)
+
+        results = await loop.run_in_executor(None, _search)
         items = [StoredItem(**r) for r in results]
         return SearchResponse(results=items, query=request.query)
     except Exception as e:
@@ -194,7 +206,12 @@ async def search_info(request: SearchRequest):
 async def chat(request: ChatRequest):
     """RAG-powered Q&A over stored content."""
     try:
-        result = answer_query(request.query, top_k=request.top_k)
+        loop = asyncio.get_event_loop()
+
+        def _answer():
+            return answer_query(request.query, top_k=request.top_k)
+
+        result = await loop.run_in_executor(None, _answer)
         sources = [StoredItem(**s) for s in result["sources"]]
         return ChatResponse(
             answer=result["answer"],
@@ -209,30 +226,80 @@ async def chat(request: ChatRequest):
 # ── Bookmark Sync ────────────────────────────────────────────
 
 
+_bookmark_sync_status = {"running": False, "processed": 0, "errors": 0, "total": 0}
+
+
 @router.post("/bookmarks/sync")
-async def sync_bookmarks(request: BookmarkSyncRequest):
-    """Parse Chrome bookmarks and queue them for ingestion."""
+async def sync_bookmarks(request: BookmarkSyncRequest, background_tasks=None):
+    """Parse Chrome bookmarks and queue them for background ingestion."""
+    global _bookmark_sync_status
+
+    if _bookmark_sync_status["running"]:
+        return {
+            "message": f"Sync already in progress ({_bookmark_sync_status['processed']}/{_bookmark_sync_status['total']})",
+            **_bookmark_sync_status,
+        }
+
     bookmarks = parse_chrome_bookmarks(request.bookmark_path)
     if not bookmarks:
         return {"message": "No bookmarks found", "count": 0}
 
-    processed = 0
-    errors = 0
-    for bm in bookmarks:
-        try:
-            text = await extract_from_url(bm["url"])
-            _process_and_store(text, source_type="bookmark", source=bm["url"])
-            processed += 1
-        except Exception as e:
-            logger.warning(f"Skipping bookmark {bm['url']}: {e}")
-            errors += 1
+    # Check which bookmarks are already stored
+    from app.storage.vector_store import _get_collection
+    collection = _get_collection()
+    existing_sources = set()
+    try:
+        all_meta = collection.get(include=["metadatas"])
+        for meta in all_meta["metadatas"]:
+            if meta.get("source_type") == "bookmark":
+                existing_sources.add(meta.get("source", ""))
+    except Exception:
+        pass
+
+    new_bookmarks = [bm for bm in bookmarks if bm["url"] not in existing_sources]
+
+    if not new_bookmarks:
+        return {"message": "All bookmarks already synced", "processed": 0, "total": len(bookmarks)}
+
+    # Run sync in background
+    _bookmark_sync_status = {"running": True, "processed": 0, "errors": 0, "total": len(new_bookmarks)}
+
+    async def _process_one_bookmark(bm, semaphore):
+        async with semaphore:
+            try:
+                text = await extract_from_url(bm["url"])
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, _process_and_store, text, "bookmark", bm["url"]
+                )
+                _bookmark_sync_status["processed"] += 1
+                logger.info(f"Synced bookmark: {bm['url']} ({_bookmark_sync_status['processed']}/{len(new_bookmarks)})")
+            except Exception as e:
+                logger.warning(f"Skipping bookmark {bm['url']}: {e}")
+                _bookmark_sync_status["errors"] += 1
+
+    async def _sync_in_background():
+        # Process 5 bookmarks concurrently for speed
+        semaphore = asyncio.Semaphore(5)
+        tasks = [_process_one_bookmark(bm, semaphore) for bm in new_bookmarks]
+        await asyncio.gather(*tasks)
+        _bookmark_sync_status["running"] = False
+        logger.info(f"Bookmark sync complete: {_bookmark_sync_status['processed']} processed, {_bookmark_sync_status['errors']} errors")
+
+    asyncio.create_task(_sync_in_background())
 
     return {
-        "message": f"Synced {processed} bookmarks ({errors} failed)",
-        "processed": processed,
-        "errors": errors,
+        "message": f"Sync started for {len(new_bookmarks)} new bookmarks ({len(existing_sources)} already synced)",
+        "new": len(new_bookmarks),
+        "already_synced": len(existing_sources),
         "total": len(bookmarks),
     }
+
+
+@router.get("/bookmarks/status")
+async def bookmark_sync_status():
+    """Check bookmark sync progress."""
+    return _bookmark_sync_status
 
 
 @router.get("/bookmarks/preview")
@@ -267,7 +334,10 @@ async def stop_watch():
 @router.get("/stats")
 async def stats():
     """Get knowledge base statistics."""
-    return get_collection_stats()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, get_collection_stats)
+    result["bookmark_sync"] = _bookmark_sync_status
+    return result
 
 
 @router.delete("/entry/{doc_id}")

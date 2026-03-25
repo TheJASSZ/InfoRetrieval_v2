@@ -12,9 +12,10 @@ def _load_model():
     if _model is not None:
         return
 
+    device = DEVICE if DEVICE != "mps" else "cpu"
     logger.info(f"Loading embedding model: {settings.embedding_model}")
-    _model = SentenceTransformer(settings.embedding_model, device=DEVICE)
-    logger.info(f"Embedding model loaded on {DEVICE}")
+    _model = SentenceTransformer(settings.embedding_model, device=device)
+    logger.info(f"Embedding model loaded on {device}")
 
 
 def embed_text(text: str) -> list[float]:

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -19,53 +20,62 @@ from app.utils.logger import get_logger
 
 logger = get_logger("main")
 
+# Thread pool for CPU-heavy watchdog processing so it doesn't block the API
+_watchdog_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="watchdog")
+
+
+def _process_file_sync(file_path: str):
+    """Process a single file (runs in thread pool, NOT on the event loop)."""
+    if is_image_file(file_path):
+        ocr_text, method = run_ocr(file_path)
+        if method != "none" and len(ocr_text) >= 20:
+            text = ocr_text
+            source_type = "image_ocr"
+        else:
+            caption = generate_caption(file_path)
+            tags = generate_tags(caption)
+            embedding = embed_text(caption)
+            add_entry(
+                summary=caption,
+                embedding=embedding,
+                source_type="image_caption",
+                source=file_path,
+                tags=tags,
+            )
+            logger.info(f"Auto-stored image caption: {file_path}")
+            return
+        summary = summarize(text)
+    elif is_document_file(file_path):
+        text = parse_document(file_path)
+        summary = summarize(text)
+        source_type = "document"
+    else:
+        return
+
+    tags = generate_tags(summary)
+    embedding = embed_text(summary)
+    add_entry(
+        summary=summary,
+        embedding=embedding,
+        source_type=source_type,
+        source=file_path,
+        tags=tags,
+        full_text=text,
+    )
+    logger.info(f"Auto-stored {source_type}: {file_path}")
+
 
 async def watchdog_consumer():
     """Background task: process files detected by the watchdog."""
+    loop = asyncio.get_event_loop()
     while True:
         try:
             file_path = await asyncio.wait_for(file_queue.get(), timeout=5.0)
             logger.info(f"Processing watchdog file: {file_path}")
 
             try:
-                if is_image_file(file_path):
-                    ocr_text, method = run_ocr(file_path)
-                    if method != "none" and len(ocr_text) >= 20:
-                        text = ocr_text
-                        source_type = "image_ocr"
-                    else:
-                        caption = generate_caption(file_path)
-                        tags = generate_tags(caption)
-                        embedding = embed_text(caption)
-                        add_entry(
-                            summary=caption,
-                            embedding=embedding,
-                            source_type="image_caption",
-                            source=file_path,
-                            tags=tags,
-                        )
-                        logger.info(f"Auto-stored image caption: {file_path}")
-                        continue
-                    summary = summarize(text)
-                elif is_document_file(file_path):
-                    text = parse_document(file_path)
-                    summary = summarize(text)
-                    source_type = "document"
-                else:
-                    continue
-
-                tags = generate_tags(summary)
-                embedding = embed_text(summary)
-                add_entry(
-                    summary=summary,
-                    embedding=embedding,
-                    source_type=source_type,
-                    source=file_path,
-                    tags=tags,
-                    full_text=text,
-                )
-                logger.info(f"Auto-stored {source_type}: {file_path}")
-
+                # Run in thread pool so API stays responsive
+                await loop.run_in_executor(_watchdog_pool, _process_file_sync, file_path)
             except Exception as e:
                 logger.error(f"Watchdog processing error for {file_path}: {e}")
 
@@ -83,6 +93,17 @@ async def lifespan(app: FastAPI):
 
     # Start watchdog consumer as background task
     consumer_task = asyncio.create_task(watchdog_consumer())
+
+    # Auto-start watchdog if WATCH_DIRS configured
+    if settings.watch_dirs:
+        dirs = [d.strip() for d in settings.watch_dirs.split(",") if d.strip()]
+        if dirs:
+            from app.ingestion.watchdog_agent import start_watchdog
+            started = start_watchdog(dirs)
+            if started:
+                logger.info(f"Auto-started watchdog on: {dirs}")
+            else:
+                logger.warning("Failed to auto-start watchdog")
 
     yield
 

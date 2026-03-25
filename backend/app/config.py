@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # Models
     blip_model_path: str = str(BASE_DIR.parent / "models" / "blip_finetuned")
-    summarizer_model: str = "google/flan-t5-base"
+    summarizer_model: str = str(BASE_DIR / "models" / "t5_finetuned" / "final_model_h200")
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     rag_llm_model: str = "google/flan-t5-large"
 

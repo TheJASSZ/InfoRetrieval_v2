@@ -12,6 +12,7 @@ frontend/node_modules/
 backend/chroma_data/
 backend/uploads/
 backend/logs/
+watch_data/
 
 # IDE settings
 .idea/

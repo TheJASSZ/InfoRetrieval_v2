@@ -167,11 +167,66 @@ def hybrid_search(
 
 
 def get_collection_stats() -> dict:
-    """Get stats about the stored collection."""
+    """Get stats about the stored collection with type breakdown and file counts."""
+    import os
+    from pathlib import Path
+
     collection = _get_collection()
+    total = collection.count()
+
+    # Get type breakdown from ChromaDB
+    type_counts = {}
+    if total > 0:
+        try:
+            all_meta = collection.get(include=["metadatas"])
+            for meta in all_meta["metadatas"]:
+                st = meta.get("source_type", "unknown")
+                type_counts[st] = type_counts.get(st, 0) + 1
+        except Exception:
+            pass
+
+    # Count actual files on disk in watch directories
+    file_counts = {"images_on_disk": 0, "documents_on_disk": 0, "bookmarks": 0}
+    watch_dirs = settings.watch_dirs
+    if watch_dirs:
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+        doc_exts = {".pdf", ".docx", ".doc", ".txt", ".md"}
+        for dir_path in watch_dirs.split(","):
+            path = Path(dir_path.strip()).expanduser()
+            if path.exists():
+                for f in path.rglob("*"):
+                    if f.is_file():
+                        ext = f.suffix.lower()
+                        if ext in image_exts:
+                            file_counts["images_on_disk"] += 1
+                        elif ext in doc_exts:
+                            file_counts["documents_on_disk"] += 1
+
+    # Count Chrome bookmarks from file
+    try:
+        bookmark_path = Path(settings.bookmark_path).expanduser()
+        if bookmark_path.exists():
+            import json as _json
+            with open(bookmark_path, "r") as f:
+                bm_data = _json.load(f)
+            def _count_bookmarks(node):
+                count = 0
+                if node.get("type") == "url":
+                    count += 1
+                for child in node.get("children", []):
+                    count += _count_bookmarks(child)
+                return count
+            for root in bm_data.get("roots", {}).values():
+                if isinstance(root, dict):
+                    file_counts["bookmarks"] += _count_bookmarks(root)
+    except Exception:
+        pass
+
     return {
-        "total_documents": collection.count(),
+        "total_documents": total,
         "collection_name": settings.chroma_collection,
+        "by_type": type_counts,
+        "file_counts": file_counts,
     }
 
 

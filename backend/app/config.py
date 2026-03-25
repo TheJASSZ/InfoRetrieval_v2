@@ -22,7 +22,19 @@ class Settings(BaseSettings):
     blip_model_path: str = str(BASE_DIR.parent / "models" / "blip_finetuned")
     summarizer_model: str = str(BASE_DIR / "models" / "t5_finetuned" / "final_model_h200")
     embedding_model: str = "BAAI/bge-base-en-v1.5"
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rag_llm_model: str = "google/flan-t5-large"
+
+    # Chunking
+    chunk_size: int = 512
+    chunk_overlap: int = 50
+
+    # RAG
+    ollama_url: str = "http://localhost:11434/api/generate"
+    ollama_model: str = "granite3.1-dense:8b"
+    relevance_threshold: float = 0.45
+    enable_contextual_retrieval: bool = True
+    enable_evaluation: bool = False
 
     # Watchdog
     watch_dirs: str = ""

@@ -46,6 +46,8 @@ export default function Index() {
           role: "assistant",
           content: res.answer,
           sources: res.sources,
+          evaluation: res.evaluation,
+          cragTriggered: res.crag_triggered,
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, assistantMsg]);

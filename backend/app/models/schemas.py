@@ -42,6 +42,17 @@ class StoredItem(BaseModel):
     tags: list[str]
     distance: float
     created_at: Optional[str] = None
+    rerank_score: Optional[float] = None
+    rrf_score: Optional[float] = None
+    parent_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+
+
+class EvaluationScores(BaseModel):
+    faithfulness: float
+    answer_relevancy: float
+    context_precision: float
+    overall: float
 
 
 class SearchResponse(BaseModel):
@@ -53,6 +64,8 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[StoredItem]
     query: str
+    evaluation: Optional[EvaluationScores] = None
+    crag_triggered: Optional[bool] = False
 
 
 class IngestResponse(BaseModel):

@@ -10,6 +10,9 @@ logger = get_logger("vector_store")
 _client = None
 _collection = None
 
+# RRF constant (Cormack et al., SIGIR 2009)
+RRF_K = 60
+
 
 def _get_collection() -> chromadb.Collection:
     global _client, _collection
@@ -37,7 +40,7 @@ def add_entry(
     tags: list[str],
     full_text: str = "",
 ) -> str:
-    """Store a document in ChromaDB with metadata."""
+    """Store a single document in ChromaDB (legacy non-chunked path)."""
     collection = _get_collection()
     doc_id = str(uuid.uuid4())
 
@@ -49,8 +52,6 @@ def add_entry(
         "full_text_length": len(full_text),
     }
 
-    # ChromaDB stores the document text for keyword search
-    # and the embedding for dense vector search
     collection.add(
         ids=[doc_id],
         embeddings=[embedding],
@@ -60,6 +61,114 @@ def add_entry(
 
     logger.info(f"Stored entry {doc_id}: {source_type} from {source}")
     return doc_id
+
+
+def add_chunks(
+    chunks: list[str],
+    embeddings: list[list[float]],
+    source_type: str,
+    source: str,
+    tags: list[str],
+    summary: str = "",
+    full_text: str = "",
+) -> list[str]:
+    """Store multiple chunks from a single document with a shared parent_id.
+
+    Each chunk gets its own embedding for precise retrieval.
+    The summary is stored in metadata for frontend display.
+    """
+    collection = _get_collection()
+    parent_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    chunk_ids = []
+
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        doc_id = str(uuid.uuid4())
+        metadata = {
+            "source_type": source_type,
+            "source": source,
+            "tags": json.dumps(tags),
+            "created_at": now,
+            "full_text_length": len(full_text),
+            "parent_id": parent_id,
+            "chunk_index": i,
+            "total_chunks": len(chunks),
+            "summary": summary[:1000],  # T5 summary for display
+        }
+
+        collection.add(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[chunk],
+            metadatas=[metadata],
+        )
+        chunk_ids.append(doc_id)
+
+    logger.info(
+        f"Stored {len(chunks)} chunks (parent={parent_id}): "
+        f"{source_type} from {source}"
+    )
+    return chunk_ids
+
+
+def get_sibling_chunks(doc_id: str, window: int = 1) -> list[str]:
+    """Get neighboring chunks for parent-child context expansion.
+
+    Retrieves sibling chunks within `window` positions of the given chunk.
+    """
+    collection = _get_collection()
+    try:
+        result = collection.get(ids=[doc_id], include=["metadatas"])
+        if not result["metadatas"]:
+            return []
+
+        meta = result["metadatas"][0]
+        parent_id = meta.get("parent_id")
+        chunk_index = meta.get("chunk_index")
+        if parent_id is None or chunk_index is None:
+            return []
+
+        # Fetch all chunks from the same parent
+        all_chunks = collection.get(
+            where={"parent_id": parent_id},
+            include=["documents", "metadatas"],
+        )
+
+        # Sort by chunk_index and return window around target
+        indexed = []
+        for i, m in enumerate(all_chunks["metadatas"]):
+            indexed.append((m.get("chunk_index", 0), all_chunks["documents"][i]))
+        indexed.sort(key=lambda x: x[0])
+
+        # Extract window around the target chunk
+        siblings = []
+        for idx, doc in indexed:
+            if abs(idx - chunk_index) <= window:
+                siblings.append(doc)
+
+        return siblings
+    except Exception as e:
+        logger.error(f"Sibling chunk retrieval error: {e}")
+        return []
+
+
+def _build_result_item(doc_id, document, metadata, distance):
+    """Build a standardized result dict from ChromaDB fields."""
+    # For chunked entries, use the stored summary for display;
+    # for legacy entries, the document IS the summary
+    display_summary = metadata.get("summary", document)
+    return {
+        "id": doc_id,
+        "summary": display_summary if display_summary else document,
+        "chunk_text": document,  # the actual indexed text
+        "source_type": metadata.get("source_type", ""),
+        "source": metadata.get("source", ""),
+        "tags": json.loads(metadata.get("tags", "[]")),
+        "distance": distance,
+        "created_at": metadata.get("created_at", ""),
+        "parent_id": metadata.get("parent_id", ""),
+        "chunk_index": metadata.get("chunk_index", -1),
+    }
 
 
 def search(
@@ -82,16 +191,12 @@ def search(
 
     items = []
     for i in range(len(results["ids"][0])):
-        metadata = results["metadatas"][0][i]
-        items.append({
-            "id": results["ids"][0][i],
-            "summary": results["documents"][0][i],
-            "source_type": metadata.get("source_type", ""),
-            "source": metadata.get("source", ""),
-            "tags": json.loads(metadata.get("tags", "[]")),
-            "distance": results["distances"][0][i],
-            "created_at": metadata.get("created_at", ""),
-        })
+        items.append(_build_result_item(
+            results["ids"][0][i],
+            results["documents"][0][i],
+            results["metadatas"][0][i],
+            results["distances"][0][i],
+        ))
 
     logger.info(f"Search returned {len(items)} results")
     return items
@@ -102,68 +207,78 @@ def hybrid_search(
     query_embedding: list[float],
     top_k: int = 5,
 ) -> list[dict]:
-    """
-    Hybrid search: combines dense vector search with ChromaDB's
-    built-in keyword filtering.
+    """Hybrid search with Reciprocal Rank Fusion (RRF).
+
+    Combines dense vector search and keyword search using RRF scoring
+    instead of a flat distance boost. RRF properly merges rankings from
+    multiple retrieval methods.
     """
     collection = _get_collection()
+    fetch_k = top_k * 3  # over-fetch for better fusion
 
-    # Dense vector search
+    # --- Dense vector search ---
     vector_results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=top_k * 2,
+        n_results=fetch_k,
         include=["documents", "metadatas", "distances"],
     )
 
-    # Keyword search using ChromaDB's where_document filter
+    # --- Keyword search ---
     keyword_results = None
     keywords = [w for w in query_text.split() if len(w) > 3]
     if keywords:
         try:
             keyword_filter = {
-                "$or": [
-                    {"$contains": kw} for kw in keywords[:3]
-                ]
+                "$or": [{"$contains": kw} for kw in keywords[:3]]
             }
             keyword_results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
+                n_results=fetch_k,
                 where_document=keyword_filter,
                 include=["documents", "metadatas", "distances"],
             )
         except Exception:
             pass
 
-    # Merge and deduplicate results
-    seen_ids = set()
-    merged = []
+    # --- Reciprocal Rank Fusion ---
+    # Build rank lists
+    rrf_scores = {}  # doc_id -> rrf_score
+    doc_data = {}  # doc_id -> result dict
 
-    def add_results(results, boost=0.0):
+    def process_result_list(results):
         if not results or not results["ids"][0]:
             return
-        for i in range(len(results["ids"][0])):
+        for rank, i in enumerate(range(len(results["ids"][0]))):
             doc_id = results["ids"][0][i]
-            if doc_id in seen_ids:
-                continue
-            seen_ids.add(doc_id)
-            metadata = results["metadatas"][0][i]
-            merged.append({
-                "id": doc_id,
-                "summary": results["documents"][0][i],
-                "source_type": metadata.get("source_type", ""),
-                "source": metadata.get("source", ""),
-                "tags": json.loads(metadata.get("tags", "[]")),
-                "distance": results["distances"][0][i] - boost,
-                "created_at": metadata.get("created_at", ""),
-            })
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + (
+                1.0 / (RRF_K + rank + 1)
+            )
+            if doc_id not in doc_data:
+                doc_data[doc_id] = _build_result_item(
+                    doc_id,
+                    results["documents"][0][i],
+                    results["metadatas"][0][i],
+                    results["distances"][0][i],
+                )
 
-    # Keyword matches get a slight boost (lower distance = better)
+    process_result_list(vector_results)
     if keyword_results:
-        add_results(keyword_results, boost=0.05)
-    add_results(vector_results)
+        process_result_list(keyword_results)
 
-    merged.sort(key=lambda x: x["distance"])
-    return merged[:top_k]
+    # Sort by RRF score (higher = more relevant)
+    ranked_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+
+    merged = []
+    for doc_id in ranked_ids[:top_k]:
+        item = doc_data[doc_id]
+        item["rrf_score"] = rrf_scores[doc_id]
+        merged.append(item)
+
+    logger.info(
+        f"Hybrid search (RRF): {len(merged)} results from "
+        f"{len(doc_data)} candidates"
+    )
+    return merged
 
 
 def get_collection_stats() -> dict:
@@ -174,18 +289,21 @@ def get_collection_stats() -> dict:
     collection = _get_collection()
     total = collection.count()
 
-    # Get type breakdown from ChromaDB
     type_counts = {}
+    chunk_count = 0
+    parent_ids = set()
     if total > 0:
         try:
             all_meta = collection.get(include=["metadatas"])
             for meta in all_meta["metadatas"]:
                 st = meta.get("source_type", "unknown")
                 type_counts[st] = type_counts.get(st, 0) + 1
+                if meta.get("parent_id"):
+                    chunk_count += 1
+                    parent_ids.add(meta["parent_id"])
         except Exception:
             pass
 
-    # Count actual files on disk in watch directories
     file_counts = {"images_on_disk": 0, "documents_on_disk": 0, "bookmarks": 0}
     watch_dirs = settings.watch_dirs
     if watch_dirs:
@@ -202,13 +320,14 @@ def get_collection_stats() -> dict:
                         elif ext in doc_exts:
                             file_counts["documents_on_disk"] += 1
 
-    # Count Chrome bookmarks from file
     try:
         bookmark_path = Path(settings.bookmark_path).expanduser()
         if bookmark_path.exists():
             import json as _json
+
             with open(bookmark_path, "r") as f:
                 bm_data = _json.load(f)
+
             def _count_bookmarks(node):
                 count = 0
                 if node.get("type") == "url":
@@ -216,6 +335,7 @@ def get_collection_stats() -> dict:
                 for child in node.get("children", []):
                     count += _count_bookmarks(child)
                 return count
+
             for root in bm_data.get("roots", {}).values():
                 if isinstance(root, dict):
                     file_counts["bookmarks"] += _count_bookmarks(root)
@@ -224,6 +344,8 @@ def get_collection_stats() -> dict:
 
     return {
         "total_documents": total,
+        "total_chunks": chunk_count,
+        "unique_parents": len(parent_ids),
         "collection_name": settings.chroma_collection,
         "by_type": type_counts,
         "file_counts": file_counts,
@@ -231,9 +353,27 @@ def get_collection_stats() -> dict:
 
 
 def delete_entry(doc_id: str) -> bool:
-    """Delete a document by ID."""
+    """Delete a document by ID. If it's a chunk, also deletes siblings."""
     collection = _get_collection()
     try:
+        # Check if it has a parent_id (is a chunk)
+        result = collection.get(ids=[doc_id], include=["metadatas"])
+        if result["metadatas"]:
+            parent_id = result["metadatas"][0].get("parent_id")
+            if parent_id:
+                # Delete all sibling chunks
+                all_siblings = collection.get(
+                    where={"parent_id": parent_id},
+                    include=[],
+                )
+                if all_siblings["ids"]:
+                    collection.delete(ids=all_siblings["ids"])
+                    logger.info(
+                        f"Deleted {len(all_siblings['ids'])} chunks "
+                        f"(parent={parent_id})"
+                    )
+                    return True
+
         collection.delete(ids=[doc_id])
         logger.info(f"Deleted entry {doc_id}")
         return True

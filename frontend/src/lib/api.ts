@@ -28,12 +28,25 @@ export interface Source {
   tags: string[];
   distance: number;
   created_at: string;
+  rerank_score?: number;
+  rrf_score?: number;
+  parent_id?: string;
+  chunk_index?: number;
+}
+
+export interface EvaluationScores {
+  faithfulness: number;
+  answer_relevancy: number;
+  context_precision: number;
+  overall: number;
 }
 
 export interface ChatResponse {
   answer: string;
   sources: Source[];
   query: string;
+  evaluation?: EvaluationScores;
+  crag_triggered?: boolean;
 }
 
 export interface SearchResponse {
@@ -43,6 +56,8 @@ export interface SearchResponse {
 
 export interface StatsResponse {
   total_documents: number;
+  total_chunks?: number;
+  unique_parents?: number;
   collection_name: string;
   by_type?: Record<string, number>;
   file_counts?: { images_on_disk: number; documents_on_disk: number; bookmarks: number };

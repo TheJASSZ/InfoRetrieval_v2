@@ -14,17 +14,22 @@ from app.models.schemas import (
     IngestResponse,
     SearchResponse,
     ChatResponse,
+    EvaluationScores,
     StoredItem,
 )
+import httpx
+from app.config import settings
 from app.extraction.web_scraper import extract_from_url
 from app.extraction.ocr_pipeline import run_ocr
 from app.extraction.document_parser import parse_document
 from app.extraction.image_captioning import generate_caption
 from app.processing.summarizer import summarize
-from app.processing.embedder import embed_text
+from app.processing.embedder import embed_text, embed_texts
 from app.processing.tagger import generate_tags
+from app.processing.chunker import chunk_text
 from app.storage.vector_store import (
     add_entry,
+    add_chunks,
     hybrid_search,
     get_collection_stats,
     delete_entry,
@@ -47,21 +52,102 @@ UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
+def _contextualize_chunk(chunk: str, full_text: str) -> str:
+    """Use Ollama to generate a context prefix for a chunk (Anthropic's contextual retrieval).
+
+    Prepends a short context snippet that situates the chunk within
+    the full document, improving retrieval precision.
+    """
+    if not settings.enable_contextual_retrieval:
+        return chunk
+
+    try:
+        # Use a truncated version of the full text for the LLM
+        doc_preview = full_text[:3000]
+        prompt = (
+            f"<document>\n{doc_preview}\n</document>\n"
+            f"Here is the chunk we want to situate within the whole document:\n"
+            f"<chunk>\n{chunk}\n</chunk>\n"
+            f"Give a short succinct context (1-2 sentences) to situate this chunk "
+            f"within the overall document for improving search retrieval. "
+            f"Answer only with the succinct context and nothing else."
+        )
+        response = httpx.post(
+            settings.ollama_url,
+            json={
+                "model": settings.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 100},
+            },
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        context_prefix = response.json().get("response", "").strip()
+        if context_prefix and len(context_prefix) > 10:
+            return f"{context_prefix}\n\n{chunk}"
+    except Exception as e:
+        logger.warning(f"Contextual retrieval failed, using raw chunk: {e}")
+
+    return chunk
+
+
 def _process_and_store(text: str, source_type: str, source: str) -> IngestResponse:
-    """Common pipeline: summarize -> tag -> embed -> store."""
+    """Enhanced pipeline: summarize -> tag -> chunk -> contextualize -> embed chunks -> store.
+
+    Upgrades over v1:
+    - Chunks original text (512 words, 50 overlap) for precise retrieval
+    - Contextual retrieval: LLM adds context prefix per chunk
+    - Embeds actual content (not just summaries)
+    - Parent-child storage for context expansion at query time
+    """
     summary = summarize(text)
     tags = generate_tags(summary)
-    embedding = embed_text(summary)
-    add_entry(
-        summary=summary,
-        embedding=embedding,
+
+    # Chunk the original text
+    chunks = chunk_text(
+        text,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    )
+
+    if not chunks:
+        # Fallback for very short text: store as single entry
+        embedding = embed_text(summary)
+        add_entry(
+            summary=summary,
+            embedding=embedding,
+            source_type=source_type,
+            source=source,
+            tags=tags,
+            full_text=text,
+        )
+        return IngestResponse(
+            message=f"Successfully stored {source_type} content",
+            summary=summary,
+            tags=tags,
+            source_type=source_type,
+        )
+
+    # Contextualize each chunk (Anthropic's contextual retrieval)
+    contextualized = [_contextualize_chunk(c, text) for c in chunks]
+
+    # Batch embed all contextualized chunks
+    embeddings = embed_texts(contextualized)
+
+    # Store as chunked document
+    add_chunks(
+        chunks=contextualized,
+        embeddings=embeddings,
         source_type=source_type,
         source=source,
         tags=tags,
+        summary=summary,
         full_text=text,
     )
+
     return IngestResponse(
-        message=f"Successfully stored {source_type} content",
+        message=f"Successfully stored {source_type} content ({len(chunks)} chunks)",
         summary=summary,
         tags=tags,
         source_type=source_type,
@@ -186,13 +272,19 @@ def _process_image(image_path: str, source: str) -> IngestResponse:
 
 @router.post("/search", response_model=SearchResponse)
 async def search_info(request: SearchRequest):
-    """Semantic search across stored content."""
+    """Semantic search with hybrid retrieval (RRF) + cross-encoder reranking."""
     try:
+        from app.processing.reranker import rerank
+
         loop = asyncio.get_event_loop()
         query_embedding = await loop.run_in_executor(None, embed_text, request.query)
 
         def _search():
-            return hybrid_search(request.query, query_embedding, top_k=request.top_k)
+            # Hybrid search with RRF, then rerank
+            candidates = hybrid_search(
+                request.query, query_embedding, top_k=request.top_k * 3
+            )
+            return rerank(request.query, candidates, top_k=request.top_k)
 
         results = await loop.run_in_executor(None, _search)
         items = [StoredItem(**r) for r in results]
@@ -213,10 +305,15 @@ async def chat(request: ChatRequest):
 
         result = await loop.run_in_executor(None, _answer)
         sources = [StoredItem(**s) for s in result["sources"]]
+        evaluation = None
+        if result.get("evaluation"):
+            evaluation = EvaluationScores(**result["evaluation"])
         return ChatResponse(
             answer=result["answer"],
             sources=sources,
             query=result["query"],
+            evaluation=evaluation,
+            crag_triggered=result.get("crag_triggered", False),
         )
     except Exception as e:
         logger.error(f"Chat error: {e}")
@@ -347,3 +444,43 @@ async def delete(doc_id: str):
     if success:
         return {"message": f"Deleted {doc_id}"}
     raise HTTPException(status_code=404, detail="Entry not found")
+
+
+@router.post("/evaluate")
+async def evaluate(request: ChatRequest):
+    """Run a RAG query with RAGAS-style evaluation enabled."""
+    try:
+        from app.retrieval.evaluator import evaluate_rag
+        from app.retrieval.rag_pipeline import (
+            _retrieve_and_rerank,
+            build_context,
+            _query_ollama,
+        )
+
+        loop = asyncio.get_event_loop()
+
+        def _eval():
+            results = _retrieve_and_rerank(request.query, request.top_k)
+            context = build_context(results)
+            prompt = (
+                "You are a helpful knowledge base assistant. Answer the user's "
+                "question using ONLY the information provided below. Be concise "
+                "and clear.\n\n"
+                f"--- Information ---\n{context}\n--- End ---\n\n"
+                f"Question: {request.query}\nAnswer:"
+            )
+            answer = _query_ollama(prompt)
+            scores = evaluate_rag(request.query, answer, context, results)
+            sources = [StoredItem(**r) for r in results]
+            return {
+                "answer": answer,
+                "sources": sources,
+                "query": request.query,
+                "evaluation": EvaluationScores(**scores),
+            }
+
+        result = await loop.run_in_executor(None, _eval)
+        return result
+    except Exception as e:
+        logger.error(f"Evaluation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

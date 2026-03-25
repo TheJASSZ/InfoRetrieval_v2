@@ -7,15 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.ingestion.router import router
+from app.ingestion.router import router, _process_and_store, _process_image
 from app.ingestion.watchdog_agent import file_queue, is_image_file, is_document_file
-from app.extraction.ocr_pipeline import run_ocr
 from app.extraction.document_parser import parse_document
-from app.extraction.image_captioning import generate_caption
-from app.processing.summarizer import summarize
-from app.processing.embedder import embed_text
-from app.processing.tagger import generate_tags
-from app.storage.vector_store import add_entry
 from app.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -25,44 +19,16 @@ _watchdog_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="watchdog"
 
 
 def _process_file_sync(file_path: str):
-    """Process a single file (runs in thread pool, NOT on the event loop)."""
+    """Process a single file using the enhanced chunked pipeline."""
     if is_image_file(file_path):
-        ocr_text, method = run_ocr(file_path)
-        if method != "none" and len(ocr_text) >= 20:
-            text = ocr_text
-            source_type = "image_ocr"
-        else:
-            caption = generate_caption(file_path)
-            tags = generate_tags(caption)
-            embedding = embed_text(caption)
-            add_entry(
-                summary=caption,
-                embedding=embedding,
-                source_type="image_caption",
-                source=file_path,
-                tags=tags,
-            )
-            logger.info(f"Auto-stored image caption: {file_path}")
-            return
-        summary = summarize(text)
+        _process_image(file_path, file_path)
+        logger.info(f"Auto-stored image: {file_path}")
     elif is_document_file(file_path):
         text = parse_document(file_path)
-        summary = summarize(text)
-        source_type = "document"
+        _process_and_store(text, source_type="document", source=file_path)
+        logger.info(f"Auto-stored document: {file_path}")
     else:
         return
-
-    tags = generate_tags(summary)
-    embedding = embed_text(summary)
-    add_entry(
-        summary=summary,
-        embedding=embedding,
-        source_type=source_type,
-        source=file_path,
-        tags=tags,
-        full_text=text,
-    )
-    logger.info(f"Auto-stored {source_type}: {file_path}")
 
 
 async def watchdog_consumer():

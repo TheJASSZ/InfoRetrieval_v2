@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, BarChart3 } from "lucide-react";
 import type { ChatMessage as ChatMessageType } from "@/lib/types";
 import { SOURCE_TYPE_ICONS } from "@/lib/types";
 import { SourceCard } from "./SourceCard";
@@ -43,40 +43,76 @@ export function ChatMessageBubble({ message }: { message: ChatMessageType }) {
           )}
         </div>
 
-        {/* Sources */}
-        {sources.length > 0 && (
-          <div className="mt-2">
-            <button
-              onClick={() => setSourcesOpen(!sourcesOpen)}
-              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {sourcesOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-              <span>{sources.length} source{sources.length !== 1 ? "s" : ""}</span>
-            </button>
-            {sourcesOpen && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2"
-              >
-                {sources.map((s, i) => (
-                  <SourceCard key={s.id || i} source={s} />
-                ))}
-              </motion.div>
+        {/* CRAG + Evaluation badges */}
+        {!isUser && (message.cragTriggered || message.evaluation) && (
+          <div className="flex items-center gap-2 mt-1.5 px-1">
+            {message.cragTriggered && (
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                <RefreshCw className="h-2.5 w-2.5" />
+                CRAG rewrite
+              </span>
+            )}
+            {message.evaluation && (
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <BarChart3 className="h-2.5 w-2.5" />
+                Quality: {(message.evaluation.overall * 100).toFixed(0)}%
+                {" "}(F:{(message.evaluation.faithfulness * 100).toFixed(0)}
+                {" "}R:{(message.evaluation.answer_relevancy * 100).toFixed(0)}
+                {" "}P:{(message.evaluation.context_precision * 100).toFixed(0)})
+              </span>
             )}
           </div>
         )}
 
-        {/* Search Results */}
+        {/* Sources: top match highlighted, rest collapsible */}
+        {sources.length > 0 && (
+          <div className="mt-2">
+            {/* Top source - always visible */}
+            <div className="mt-1.5">
+              <SourceCard source={sources[0]} highlighted />
+            </div>
+
+            {/* Remaining sources - collapsible */}
+            {sources.length > 1 && (
+              <>
+                <button
+                  onClick={() => setSourcesOpen(!sourcesOpen)}
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mt-2"
+                >
+                  {sourcesOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  <span>{sources.length - 1} more source{sources.length - 1 !== 1 ? "s" : ""}</span>
+                </button>
+                {sourcesOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2"
+                  >
+                    {sources.slice(1).map((s, i) => (
+                      <SourceCard key={s.id || i} source={s} />
+                    ))}
+                  </motion.div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Search Results: top match highlighted */}
         {searchResults.length > 0 && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3"
+            className="flex flex-col gap-2 mt-3"
           >
-            {searchResults.map((r, i) => (
-              <SourceCard key={r.id || i} source={r} showSummary />
-            ))}
+            <SourceCard source={searchResults[0]} showSummary highlighted />
+            {searchResults.length > 1 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {searchResults.slice(1).map((r, i) => (
+                  <SourceCard key={r.id || i} source={r} showSummary />
+                ))}
+              </div>
+            )}
           </motion.div>
         )}
 

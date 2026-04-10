@@ -206,22 +206,30 @@ def hybrid_search(
     query_text: str,
     query_embedding: list[float],
     top_k: int = 5,
+    where: dict | None = None,
 ) -> list[dict]:
     """Hybrid search with Reciprocal Rank Fusion (RRF).
 
     Combines dense vector search and keyword search using RRF scoring
     instead of a flat distance boost. RRF properly merges rankings from
     multiple retrieval methods.
+
+    Args:
+        where: Optional ChromaDB metadata filter (e.g. {"source_type": "text"})
     """
     collection = _get_collection()
     fetch_k = top_k * 3  # over-fetch for better fusion
 
     # --- Dense vector search ---
-    vector_results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=fetch_k,
-        include=["documents", "metadatas", "distances"],
-    )
+    vector_kwargs = {
+        "query_embeddings": [query_embedding],
+        "n_results": fetch_k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        vector_kwargs["where"] = where
+
+    vector_results = collection.query(**vector_kwargs)
 
     # --- Keyword search ---
     keyword_results = None
@@ -231,12 +239,15 @@ def hybrid_search(
             keyword_filter = {
                 "$or": [{"$contains": kw} for kw in keywords[:3]]
             }
-            keyword_results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=fetch_k,
-                where_document=keyword_filter,
-                include=["documents", "metadatas", "distances"],
-            )
+            kw_kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": fetch_k,
+                "where_document": keyword_filter,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where:
+                kw_kwargs["where"] = where
+            keyword_results = collection.query(**kw_kwargs)
         except Exception:
             pass
 

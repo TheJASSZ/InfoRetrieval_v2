@@ -108,7 +108,7 @@ def _process_and_store(text: str, source_type: str, source: str) -> IngestRespon
     chunks = chunk_text(
         text,
         chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
+        overlap=settings.chunk_overlap,
     )
 
     if not chunks:
@@ -318,6 +318,7 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ── Bookmark Sync ────────────────────────────────────────────

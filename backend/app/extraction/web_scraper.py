@@ -62,6 +62,46 @@ async def scrape_with_playwright(url: str) -> str | None:
         return None
 
 
+def _is_garbage_content(text: str) -> bool:
+    """Detect scraped content that is garbage (blocked pages, JSON blobs, etc.)."""
+    lower = text.lower().strip()
+
+    # Cloudflare / bot protection pages
+    garbage_markers = [
+        "performing security verification",
+        "this website is using a security service",
+        "enable javascript and cookies to continue",
+        "please verify you are a human",
+        "access denied",
+        "403 forbidden",
+        "you have been banned",
+        "attention required! | cloudflare",
+        "just a moment...",
+        "checking your browser before accessing",
+        "ray id:",
+    ]
+    if any(marker in lower for marker in garbage_markers):
+        logger.warning(f"Garbage detected: matched security/block marker")
+        return True
+
+    # Raw JSON / structured data (not actual article content)
+    stripped = text.strip()
+    if (stripped.startswith("{") or stripped.startswith("[")) and len(stripped) > 100:
+        # Check if it looks like JSON
+        brace_count = stripped.count("{") + stripped.count("[")
+        if brace_count > 5:
+            logger.warning("Garbage detected: looks like raw JSON")
+            return True
+
+    # Mostly non-alphabetic (encoded data, URLs, etc.)
+    alpha_chars = sum(1 for c in text if c.isalpha())
+    if len(text) > 100 and alpha_chars / len(text) < 0.4:
+        logger.warning("Garbage detected: low alphabetic ratio")
+        return True
+
+    return False
+
+
 async def extract_from_url(url: str) -> str:
     """Try Trafilatura first (fast), fall back to Playwright (thorough)."""
     # Skip URLs that are unlikely to have useful content
@@ -72,11 +112,16 @@ async def extract_from_url(url: str) -> str:
 
     text = scrape_with_trafilatura(url)
     if text:
-        return text
+        if _is_garbage_content(text):
+            logger.warning(f"Trafilatura returned garbage for {url}, trying Playwright")
+        else:
+            return text
 
     logger.info(f"Falling back to Playwright for {url}")
     text = await scrape_with_playwright(url)
     if text:
+        if _is_garbage_content(text):
+            raise ValueError(f"Only garbage content extracted from URL: {url}")
         return text
 
     raise ValueError(f"Failed to extract content from URL: {url}")

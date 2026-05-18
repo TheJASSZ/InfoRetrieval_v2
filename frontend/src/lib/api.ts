@@ -1,4 +1,5 @@
-const API_BASE = "http://localhost:8000";
+// In Docker, nginx proxies /api/* to backend; in local dev, hit backend directly
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const TIMEOUT = 120000;
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {

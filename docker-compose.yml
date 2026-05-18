@@ -1,22 +1,50 @@
 version: "3.9"
 
 services:
+  # Ollama — local LLM server for RAG chat
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # On first run, pull the model: docker exec -it inforetrieval-ollama-1 ollama pull granite3.1-dense:2b
+
+  # FastAPI backend — ingestion, processing, retrieval, RAG
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     volumes:
-      - ./backend:/app
-      - ./models:/models
-      - chroma_data:/app/chroma_data
+      - ./models:/models                    # Fine-tuned BLIP LoRA weights
+      - ./backend/app/models:/app/app/models # Fine-tuned T5 weights
+      - chroma_data:/app/chroma_data         # Persistent vector store
+      - ./watch_data:/watch_data             # Watched directories for auto-ingestion
     environment:
-      - DEVICE=auto
-      - BLIP_MODEL_PATH=/models/blip_finetuned
+      - DEVICE_PREFERENCE=auto
       - CHROMA_PERSIST_DIR=/app/chroma_data
+      - CHROMA_COLLECTION=info_store
+      - BLIP_MODEL_PATH=/models/blip_finetuned
+      - SUMMARIZER_MODEL=/app/app/models/t5_finetuned/final_model_h200
+      - EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+      - OLLAMA_URL=http://ollama:11434/api/generate
+      - OLLAMA_MODEL=granite3.1-dense:2b
+      - ENABLE_CONTEXTUAL_RETRIEVAL=false
+      - WATCH_DIRS=/watch_data/documents,/watch_data/images
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+    depends_on:
+      - ollama
     restart: unless-stopped
 
+  # React frontend — served via nginx with API proxy to backend
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_BASE=
     ports:
       - "5173:5173"
     depends_on:
@@ -24,4 +52,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  ollama_data:
   chroma_data:

@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium --with-deps
 
+# Copy application code (models and chroma_data are mounted as volumes)
 COPY . .
 
 EXPOSE 8000

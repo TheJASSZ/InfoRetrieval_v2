@@ -150,31 +150,34 @@ InfoRetrieval_v2Claude/
 │   ├── requirements.txt              # Python dependencies
 │   ├── .env                          # Environment configuration
 │   ├── .env.example                  # Template for environment variables
-│   └── Dockerfile                    # Container build for backend
+│   ├── .dockerignore                 # Files excluded from Docker build
+│   ├── Dockerfile                    # Container build for backend
+│   ├── bulk_ingest.py               # Bulk ingestion script (URLs, docs, images)
+│   └── ingest_remaining.py          # Resume ingestion for unprocessed files
 │
-├── frontend/                         # React + Vite + Bootstrap frontend
-│   ├── index.html                    # HTML entry point (loads Bootstrap CDN)
+├── frontend/                         # React + Vite + TypeScript + shadcn/ui frontend
+│   ├── index.html                    # HTML entry point
 │   ├── package.json                  # Node dependencies
-│   ├── vite.config.js                # Vite config with API proxy to :8000
+│   ├── vite.config.ts                # Vite config
+│   ├── Dockerfile                    # Multi-stage build: npm → nginx
+│   ├── nginx.conf                    # Nginx config (proxies /api/* to backend)
+│   ├── .dockerignore                 # Files excluded from Docker build
 │   └── src/
-│       ├── main.jsx                  # React entry point with BrowserRouter
-│       ├── App.jsx                   # Root component: navbar + route definitions
-│       ├── index.css                 # Global dark theme styles
+│       ├── main.tsx                  # React entry point
+│       ├── App.tsx                   # Root component with routes
 │       │
-│       ├── components/
-│       │   ├── SearchBar.jsx         # Reusable search input with loading state
-│       │   ├── ResultCard.jsx        # Search result display (summary, tags, source badge, score)
-│       │   ├── UploadPanel.jsx       # Tabbed upload: URL / Text / File with API calls
-│       │   ├── ChatInterface.jsx     # RAG-powered chat with message bubbles + source cards
-│       │   └── Dashboard.jsx         # Stats display (total documents, refresh button)
+│       ├── components/               # shadcn/ui + custom components
+│       │   ├── ChatInput.tsx         # Chat input with send button
+│       │   ├── ChatMessage.tsx       # Message bubbles with markdown rendering
+│       │   ├── SourceCard.tsx        # Source citation cards
+│       │   ├── StatsBar.tsx          # Knowledge base stats display
+│       │   └── AppSidebar.tsx        # Navigation sidebar
 │       │
 │       ├── pages/
-│       │   ├── Home.jsx              # Dashboard + Upload panel + AI Chat (main page)
-│       │   ├── Search.jsx            # Full-page semantic search with results list
-│       │   └── Settings.jsx          # Watchdog config + Chrome bookmark sync/preview
+│       │   └── Index.tsx             # Main page: chat + search + upload
 │       │
-│       └── services/
-│           └── api.js                # Axios API client for all backend endpoints
+│       └── lib/
+│           └── api.ts                # Typed API client for all backend endpoints
 │
 ├── training/                         # Fine-tuning scripts (run on HPC cluster)
 │   ├── train_t5_xsum.py             # Fine-tune T5-base on XSum or CNN-DailyMail
@@ -186,7 +189,10 @@ InfoRetrieval_v2Claude/
 │       ├── adapter_config.json       # LoRA config (r=16, alpha=32, target=query,value)
 │       └── adapter_model.safetensors # Trained LoRA adapter weights
 │
-├── docker-compose.yml                # Multi-container orchestration (backend + frontend)
+├── docker-compose.yml                # Multi-container orchestration (ollama + backend + frontend)
+├── watch_data/                      # Auto-ingestion directories
+│   ├── documents/                   # Drop PDFs, DOCX, TXT files here
+│   └── images/                      # Drop JPG, PNG images here
 └── README.md                         # This file
 ```
 
@@ -600,21 +606,157 @@ Note: BLIP and some operations fall back to CPU on MPS due to operator support l
 
 ## Docker Deployment
 
-```bash
-# Build and run both services
-docker-compose up --build
+Docker is the **easiest way** to run the entire project on any machine — no need to install Python, Node.js, Tesseract, or Ollama manually. Everything runs in containers.
 
-# Or run in background
+### Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+- At least **8GB RAM** allocated to Docker (Settings → Resources)
+- ~5GB free disk space (for model downloads and container images)
+
+### Quick Start
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/TheJASSZ/InfoRetrieval_v2.git
+cd InfoRetrieval_v2
+
+# 2. Create watch directories for auto-ingestion
+mkdir -p watch_data/documents watch_data/images
+
+# 3. Build and start all 3 services (Ollama + Backend + Frontend)
 docker-compose up --build -d
 
-# Stop
-docker-compose down
+# 4. Pull the LLM model into Ollama (first time only, ~1.6GB)
+docker exec -it inforetrieval_v2-ollama-1 ollama pull granite3.1-dense:2b
+
+# 5. Open in browser
+open http://localhost:5173
 ```
 
-- Backend: http://localhost:8000
-- Frontend: http://localhost:5173
+### Services
 
-The Docker setup includes Tesseract OCR and Playwright Chromium pre-installed.
+| Service | URL | What It Does |
+|---------|-----|-------------|
+| **Frontend** | http://localhost:5173 | React UI (chat, search, upload) — served by nginx |
+| **Backend** | http://localhost:8000 | FastAPI (ingestion, processing, RAG) |
+| **Ollama** | http://localhost:11434 | Local LLM for RAG chat (Granite 2B) |
+| **Swagger Docs** | http://localhost:8000/docs | Interactive API documentation |
+
+### Architecture in Docker
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Frontend   │────▶│   Backend    │────▶│    Ollama     │
+│  (nginx:5173)│     │ (FastAPI:8000│     │ (LLM:11434)  │
+│              │     │              │     │              │
+│ Proxies /api │     │ ChromaDB     │     │ Granite 2B   │
+│ to backend   │     │ T5, BGE, BLIP│     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+       │                    │                     │
+       │              chroma_data            ollama_data
+       │              (volume)               (volume)
+```
+
+The nginx proxy forwards all `/api/*` requests from the frontend to the backend, so everything works through a single port (5173).
+
+### Docker Commands
+
+```bash
+# Start all services
+docker-compose up --build -d
+
+# View logs (all services)
+docker-compose logs -f
+
+# View logs (specific service)
+docker-compose logs -f backend
+docker-compose logs -f ollama
+
+# Check service status
+docker-compose ps
+
+# Stop all services
+docker-compose down
+
+# Stop and remove all data (volumes)
+docker-compose down -v
+
+# Rebuild after code changes
+docker-compose up --build -d
+```
+
+### Volumes (Persistent Data)
+
+| Volume | Purpose |
+|--------|---------|
+| `chroma_data` | ChromaDB vector database — survives container restarts |
+| `ollama_data` | Downloaded Ollama models — avoids re-downloading |
+| `./watch_data` | Bind mount — drop files here for auto-ingestion |
+| `./models` | Bind mount — fine-tuned BLIP LoRA weights |
+
+### Using a Larger Model
+
+To use the 8B model (better quality, slower):
+
+```bash
+# Pull the larger model
+docker exec -it inforetrieval_v2-ollama-1 ollama pull granite3.1-dense:8b
+
+# Update docker-compose.yml: change OLLAMA_MODEL to granite3.1-dense:8b
+# Then restart:
+docker-compose up -d backend
+```
+
+### Bulk Ingestion (Loading Data)
+
+After services are running, use the bulk ingestion script to load content:
+
+```bash
+# Enter the backend container
+docker exec -it inforetrieval_v2-backend-1 bash
+
+# Ingest 50 curated Wikipedia URLs
+python bulk_ingest.py --urls
+
+# Ingest documents from watch_data/documents
+python bulk_ingest.py --docs
+
+# Ingest images from watch_data/images
+python bulk_ingest.py --images
+
+# Ingest everything
+python bulk_ingest.py --all
+```
+
+Or from outside the container, use the API directly:
+
+```bash
+# Store a URL
+curl -X POST http://localhost:8000/api/store/url \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://en.wikipedia.org/wiki/Machine_learning"}'
+
+# Store text
+curl -X POST http://localhost:8000/api/store/text \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Your content here", "title": "My Note"}'
+```
+
+### Troubleshooting Docker
+
+| Issue | Fix |
+|-------|-----|
+| `ollama pull` fails | Ensure Ollama container is running: `docker-compose ps` |
+| Backend can't reach Ollama | The docker-compose config uses `http://ollama:11434` (Docker DNS). Don't change this. |
+| Frontend shows blank page | Wait 10-20s for backend to start. Check: `curl http://localhost:8000/health` |
+| Models loading slowly | First request loads ML models (~30-60s). Subsequent requests are faster. |
+| Out of disk space | Run `docker system prune` to clean unused images/containers |
+| Port already in use | Stop local services first: `pkill ollama; pkill uvicorn` |
+
+### Running Locally (Alternative to Docker)
+
+If you prefer running without Docker, see [Setup & Installation](#setup--installation) above. You'll need to install Python 3.11+, Node.js 18+, Tesseract OCR, and Ollama manually.
 
 ---
 
